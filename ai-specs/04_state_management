@@ -1,0 +1,121 @@
+### Vuex Store Structure
+
+Adapt the existing Vuex structure to accommodate real-time multiplayer features.
+store/
+├── index.js # Root store setup
+└── modules/
+├── auth.js # NEW: Handles Firebase Auth state, user profile
+├── balance.js # REPURPOSED/REMOVED?: Or kept for global balance if needed outside rooms
+├── room.js # NEW: Manages state related to the current joined room
+├── slots.js # Existing: Slot definitions (fetched once)
+├── paytable.js # Existing: Paytable definitions (fetched once)
+├── socket.js # NEW: Manages Socket.io connection state and listeners (inspired by Ludoet)
+
+### Module Details
+
+1.  **`auth.js` (New)**
+    *   **State:** `user` (Object | null - Firebase Auth user), `isAuthenticated` (Boolean), `profile` (Object | null - User data from DB).
+    *   **Actions:** `loginWithFirebase`, `logout`, `fetchUserProfile`, `initAuthListener`.
+    *   **Mutations:** `SET_USER`, `SET_AUTHENTICATED`, `SET_PROFILE`.
+    *   **Getters:** `currentUser`, `isLoggedIn`.
+
+2.  **`room.js` (New)**
+    *   **State:**
+        *   `currentRoomId` (String | null)
+        *   `roomStatus` (String | null - e.g., 'waiting', 'active', 'ended')
+        *   `players` (Array<Object> - List of players in the current room: `{ userId, displayName, currentCoins }`)
+        *   `leaderboard` (Array<Object> - Sorted list: `{ userId, displayName, currentCoins }`)
+        *   `timeLeftSeconds` (Number | null)
+        *   `winner` (Object | null - `{ userId, displayName }` when room ends)
+        *   `finalLeaderboard` (Array<Object> | null - Set when room ends)
+        *   `isJoining` (Boolean)
+        *   `joinError` (String | null)
+    *   **Actions:**
+        *   `findAndJoinRoom({ roomId })` (Emits `joinRoom` via socket module).
+        *   `leaveCurrentRoom()` (Emits `leaveRoom` via socket module).
+        *   `handleRoomJoined({ roomState, leaderboard })` (Called by socket listener).
+        *   `handleLeaderboardUpdate({ leaderboard, timeLeftSeconds })` (Called by socket listener).
+        *   `handleUserJoined({ userId, displayName, usersInSession })` (Called by socket listener).
+        *   `handleUserLeft({ userId })` (Called by socket listener).
+        *   `handleRoomEnded({ winner, finalLeaderboard })` (Called by socket listener).
+        *   `clearRoomState()` (Called on leave/end).
+    *   **Mutations:**
+        *   `SET_CURRENT_ROOM_ID`, `SET_ROOM_STATUS`, `SET_PLAYERS`, `UPDATE_PLAYER_COINS`, `ADD_PLAYER`, `REMOVE_PLAYER`, `SET_LEADERBOARD`, `SET_TIME_LEFT`, `SET_WINNER`, `SET_FINAL_LEADERBOARD`, `SET_IS_JOINING`, `SET_JOIN_ERROR`, `RESET_ROOM_STATE`.
+    *   **Getters:** `isInRoom`, `currentRoomInfo`, `playerList`, `rankedLeaderboard`, `roomTimeRemainingFormatted`, `roomWinner`.
+
+3.  **`slots.js` & `paytable.js` (Existing)**
+    *   Likely remain as-is, fetching static game configuration data.
+    *   Actions: `fetchSlots`, `fetchPayTable`.
+    *   Mutations: `updateSlots`, `updatePayTable`.
+    *   State: `slots`, `paytable`.
+    *   Getters: `allSlots`, `payTables`.
+
+4.  **`balance.js` (Review Purpose)**
+    *   The current implementation manages a *general* balance. In a tournament room context, the primary "balance" is the `currentCoins` earned *within that room*, managed in the `room.js` module.
+    *   **Decision:** Keep `balance.js` *only* if there's a concept of a global user balance used for entry fees or other non-room features. Otherwise, remove or significantly simplify it. The `changeBalance` action/mutation needs to be replaced by room-specific coin updates triggered by server `spinResult` events.
+    *   **Starter Code Change:** The `slotMachine.vue` component currently calls `this.$store.dispatch('changeBalance', { diff: -1, type: 'press button' })` before spinning. This needs to be removed or adapted. Spins might be free in the tournament, or the cost deduction logic needs to be handled server-side if entry fees deplete a balance. The `changeBallance` method used for *rewards* also needs to be removed; rewards are applied via mutations triggered by server `spinResult` events.
+
+5.  **`socket.js` (New - Inspired by Ludoet)**
+    *   **State:** `socket` (Object | null - Socket.io instance), `isConnected` (Boolean), `sessionId` (String | null - Socket.io session ID, less relevant than `roomId`), `error` (String | null).
+    *   **Actions:**
+        *   `initializeSocket({ rootState })` (Connects, sets up core listeners: `connect`, `disconnect`, `error`, `authenticated`, `auth_error`). Gets user token from `auth` module. Emits `authenticate`.
+        *   `registerRoomListeners()` (Sets up room-specific listeners: `roomJoined`, `userJoined`, `userLeft`, `leaderboardUpdate`, `spinResult`, `roomEnded`. Dispatches actions to `room.js` module).
+        *   `removeRoomListeners()` (Cleans up room-specific listeners).
+        *   `emitEvent({ event, payload })` (Generic helper to emit socket events).
+        *   `joinRoom({ roomId })` (Uses `emitEvent` to send `joinRoom`).
+        *   `leaveRoom({ roomId })` (Uses `emitEvent` to send `leaveRoom`).
+        *   `requestSpin({ roomId })` (Uses `emitEvent` to send `spinRequest`).
+        *   `closeSocket()` (Disconnects).
+    *   **Mutations:** `SET_SOCKET`, `SET_CONNECTED`, `SET_SOCKET_ERROR`, `CLEAR_SOCKET_ERROR`.
+    *   **Getters:** `socketInstance`, `connectionState`.
+
+### Vuex Snippet Example (room.js mutation)
+
+```javascript
+// store/modules/room.js
+// ...
+mutations: {
+  // Called when the server sends the result of a spin
+  UPDATE_PLAYER_COINS(state, { userId, coinsWon, newTotalCoins }) {
+    const player = state.players.find(p => p.userId === userId);
+    if (player) {
+      player.currentCoins = newTotalCoins; // Update player's coin total in the list
+      // Note: Leaderboard update might happen via a separate SET_LEADERBOARD mutation
+      // triggered by the 'leaderboardUpdate' socket event for consistency.
+    }
+  },
+
+  SET_LEADERBOARD(state, leaderboard) {
+    // Assuming leaderboard is already sorted [{ userId, displayName, currentCoins }, ...]
+    state.leaderboard = leaderboard;
+    // Optionally update state.players based on leaderboard if it's the source of truth
+    state.players = leaderboard.map(entry => ({
+        userId: entry.userId,
+        displayName: entry.displayName,
+        currentCoins: entry.currentCoins
+        // Add other player details if needed/available
+    }));
+  },
+
+  SET_TIME_LEFT(state, seconds) {
+    state.timeLeftSeconds = seconds;
+  },
+
+  SET_ROOM_STATUS(state, status) {
+    state.roomStatus = status;
+  },
+
+  RESET_ROOM_STATE(state) {
+    state.currentRoomId = null;
+    state.roomStatus = null;
+    state.players = [];
+    state.leaderboard = [];
+    state.timeLeftSeconds = null;
+    state.winner = null;
+    state.finalLeaderboard = null;
+    state.isJoining = false;
+    state.joinError = null;
+  }
+  // ... other mutations: SET_CURRENT_ROOM_ID, ADD_PLAYER, REMOVE_PLAYER etc.
+}
+// ...
